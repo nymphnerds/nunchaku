@@ -274,38 +274,61 @@ class NunchakuZImageFeedForward(NunchakuSDXLFeedForward):
         NunchakuSDXLFeedForward.__init__(self, converted_ff, **kwargs)
 
 
-def _pad_lora_pair(
-    lora_down: torch.Tensor,
-    lora_up: torch.Tensor,
-    divisor: int = 16,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    rank = lora_down.shape[1]
-    padded_rank = ((rank + divisor - 1) // divisor) * divisor
-    if padded_rank == rank:
-        return lora_down, lora_up
-    new_down = torch.zeros(lora_down.shape[0], padded_rank, dtype=lora_down.dtype, device=lora_down.device)
-    new_up = torch.zeros(lora_up.shape[0], padded_rank, dtype=lora_up.dtype, device=lora_up.device)
-    new_down[:, :rank] = lora_down
-    new_up[:, :rank] = lora_up
-    return new_down, new_up
+def pack_lowrank_weight(weight: torch.Tensor, down: bool) -> torch.Tensor:
+    """
+    Pack a low-rank weight tensor into the layout expected by Nunchaku's
+    fused W4A4 kernels.
+
+    Parameters
+    ----------
+    weight : torch.Tensor
+        Unpacked low-rank weight tensor.
+    down : bool
+        True for the down-projection (rank x in), False for the up-projection
+        (out x rank).
+    """
+    assert weight.dtype in (torch.float16, torch.bfloat16), f"Unsupported weight dtype {weight.dtype}."
+    lane_n, lane_k = 1, 2
+    n_pack_size, k_pack_size = 2, 2
+    num_n_lanes, num_k_lanes = 8, 4
+    frag_n = n_pack_size * num_n_lanes * lane_n
+    frag_k = k_pack_size * num_k_lanes * lane_k
+    weight = pad_tensor(weight, frag_n, 0)
+    weight = pad_tensor(weight, frag_k, 1)
+    if down:
+        r, c = weight.shape
+        r_frags, c_frags = r // frag_n, c // frag_k
+        weight = weight.view(r_frags, frag_n, c_frags, frag_k).permute(2, 0, 1, 3)
+    else:
+        c, r = weight.shape
+        c_frags, r_frags = c // frag_n, r // frag_k
+        weight = weight.view(c_frags, frag_n, r_frags, frag_k).permute(0, 2, 1, 3)
+    weight = weight.reshape(c_frags, r_frags, n_pack_size, num_n_lanes, k_pack_size, num_k_lanes, lane_k)
+    weight = weight.permute(0, 1, 3, 5, 2, 4, 6).contiguous()
+    return weight.view(c, r)
 
 
 def _fuse_lora_pairs(
     lora_pairs: List[tuple[torch.Tensor, torch.Tensor]],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    lora_down = torch.cat([down for down, _ in lora_pairs], dim=1)
-    total_rank = lora_down.shape[1]
+    if all(down.equal(lora_pairs[0][0]) for down, _ in lora_pairs[1:]):
+        lora_down = lora_pairs[0][0]
+        lora_up = torch.cat([up for _, up in lora_pairs], dim=0)
+        return lora_down, lora_up
+
+    lora_down = torch.cat([down for down, _ in lora_pairs], dim=0)
+    total_rank = lora_down.shape[0]
     total_out = sum(up.shape[0] for _, up in lora_pairs)
     lora_up = torch.zeros(total_out, total_rank, dtype=lora_pairs[0][1].dtype, device=lora_pairs[0][1].device)
     row_offset = 0
     col_offset = 0
     for down, up in lora_pairs:
         out_features = up.shape[0]
-        rank = down.shape[1]
+        rank = down.shape[0]
         lora_up[row_offset : row_offset + out_features, col_offset : col_offset + rank] = up
         row_offset += out_features
         col_offset += rank
-    return _pad_lora_pair(lora_down, lora_up)
+    return lora_down, lora_up
 
 
 def _replace_module_parameter(module: nn.Module, attr_name: str, tensor: torch.Tensor):
@@ -428,12 +451,16 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
         swiglu_groups: Dict[str, Dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
 
         def _store_single(module_name: str, pair: tuple[torch.Tensor, torch.Tensor]):
-            quantized_loras[module_name] = _pad_lora_pair(*pair)
+            lora_down, lora_up = pair
+            quantized_loras[module_name] = (
+                pack_lowrank_weight(lora_down, down=True),
+                pack_lowrank_weight(lora_up, down=False),
+            )
 
         for prefix, pair in grouped_loras.items():
             if "A" not in pair or "B" not in pair:
                 continue
-            lora_down = pair["A"].transpose(0, 1).contiguous()
+            lora_down = pair["A"].contiguous()
             lora_up = pair["B"].contiguous()
             module_pair = (lora_down, lora_up)
 
@@ -461,12 +488,20 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
         for module_name, parts in qkv_groups.items():
             if set(parts.keys()) != {0, 1, 2}:
                 continue
-            quantized_loras[module_name] = _fuse_lora_pairs([parts[0], parts[1], parts[2]])
+            lora_down, lora_up = _fuse_lora_pairs([parts[0], parts[1], parts[2]])
+            quantized_loras[module_name] = (
+                pack_lowrank_weight(lora_down, down=True),
+                pack_lowrank_weight(lora_up, down=False),
+            )
 
         for module_name, parts in swiglu_groups.items():
             if set(parts.keys()) != {0, 1}:
                 continue
-            quantized_loras[module_name] = _fuse_lora_pairs([parts[0], parts[1]])
+            lora_down, lora_up = _fuse_lora_pairs([parts[0], parts[1]])
+            quantized_loras[module_name] = (
+                pack_lowrank_weight(lora_down, down=True),
+                pack_lowrank_weight(lora_up, down=False),
+            )
 
         return quantized_loras
 
