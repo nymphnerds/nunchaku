@@ -497,7 +497,13 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
         for module_name, parts in swiglu_groups.items():
             if set(parts.keys()) != {0, 1}:
                 continue
-            lora_down, lora_up = _fuse_lora_pairs([parts[0], parts[1]])
+            # diffusers' SwiGLU proj is ordered as [hidden, gate], while the
+            # original Z-Image feed-forward uses w2(silu(w1(x)) * w3(x)).
+            # That means:
+            #   - hidden chunk should map to w3
+            #   - gate chunk should map to w1
+            # So the fused LoRA order for net.0.proj must be [w3, w1].
+            lora_down, lora_up = _fuse_lora_pairs([parts[1], parts[0]])
             quantized_loras[module_name] = (
                 pack_lowrank_weight(lora_down, down=True),
                 pack_lowrank_weight(lora_up, down=False),
