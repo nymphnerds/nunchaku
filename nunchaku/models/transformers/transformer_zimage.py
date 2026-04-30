@@ -5,7 +5,7 @@ This module provides Nunchaku ZImageTransformer2DModel and its building blocks i
 import json
 import os
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -20,7 +20,7 @@ from nunchaku.models.unets.unet_sdxl import NunchakuSDXLFeedForward
 
 from ...ops.gemm import svdq_gemm_w4a4_cuda
 from ...ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda
-from ...utils import get_precision, pad_tensor
+from ...utils import get_precision, load_state_dict_in_safetensors, pad_tensor
 from ..attention import NunchakuBaseAttention
 from ..attention_processors.zimage import NunchakuZSingleStreamAttnProcessor
 from ..embeddings import pack_rotemb
@@ -274,10 +274,66 @@ class NunchakuZImageFeedForward(NunchakuSDXLFeedForward):
         NunchakuSDXLFeedForward.__init__(self, converted_ff, **kwargs)
 
 
+def _pad_lora_pair(
+    lora_down: torch.Tensor,
+    lora_up: torch.Tensor,
+    divisor: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rank = lora_down.shape[1]
+    padded_rank = ((rank + divisor - 1) // divisor) * divisor
+    if padded_rank == rank:
+        return lora_down, lora_up
+    new_down = torch.zeros(lora_down.shape[0], padded_rank, dtype=lora_down.dtype, device=lora_down.device)
+    new_up = torch.zeros(lora_up.shape[0], padded_rank, dtype=lora_up.dtype, device=lora_up.device)
+    new_down[:, :rank] = lora_down
+    new_up[:, :rank] = lora_up
+    return new_down, new_up
+
+
+def _fuse_lora_pairs(
+    lora_pairs: List[tuple[torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    lora_down = torch.cat([down for down, _ in lora_pairs], dim=1)
+    total_rank = lora_down.shape[1]
+    total_out = sum(up.shape[0] for _, up in lora_pairs)
+    lora_up = torch.zeros(total_out, total_rank, dtype=lora_pairs[0][1].dtype, device=lora_pairs[0][1].device)
+    row_offset = 0
+    col_offset = 0
+    for down, up in lora_pairs:
+        out_features = up.shape[0]
+        rank = down.shape[1]
+        lora_up[row_offset : row_offset + out_features, col_offset : col_offset + rank] = up
+        row_offset += out_features
+        col_offset += rank
+    return _pad_lora_pair(lora_down, lora_up)
+
+
+def _replace_module_parameter(module: nn.Module, attr_name: str, tensor: torch.Tensor):
+    old_param = getattr(module, attr_name)
+    new_param = nn.Parameter(
+        tensor.to(device=old_param.device, dtype=old_param.dtype),
+        requires_grad=old_param.requires_grad,
+    )
+    setattr(module, attr_name, new_param)
+
+
+def _zimage_lora_attrs(module: nn.Module) -> tuple[str, str] | None:
+    if isinstance(module, SVDQW4A4Linear):
+        return "proj_down", "proj_up"
+    if isinstance(module, NunchakuZImageFusedModule):
+        return "qkv_proj_down", "qkv_proj_up"
+    return None
+
+
 class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLoaderMixin):
     """
     Nunchaku-optimized ZImageTransformer2DModel.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._quantized_part_sd: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._quantized_part_loras: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
 
     def _patch_model(self, skip_refiners: bool = False, **kwargs):
         """
@@ -331,6 +387,124 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
         for h in self.rope_hook_handles:
             h.remove()
         self.rope_hook_handles.clear()
+
+    def _capture_base_lora_state(self):
+        base_lora_state: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        for module_name, module in self.named_modules():
+            lora_attrs = _zimage_lora_attrs(module)
+            if lora_attrs is None:
+                continue
+            down_attr, up_attr = lora_attrs
+            lora_down = getattr(module, down_attr, None)
+            lora_up = getattr(module, up_attr, None)
+            if lora_down is None or lora_up is None:
+                continue
+            base_lora_state[module_name] = (
+                lora_down.detach().clone(),
+                lora_up.detach().clone(),
+            )
+        self._quantized_part_sd = base_lora_state
+
+    def _map_external_lora_to_quantized_modules(
+        self,
+        path_or_state_dict: str | dict[str, torch.Tensor],
+    ) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
+        if isinstance(path_or_state_dict, dict):
+            state_dict = dict(path_or_state_dict)
+        else:
+            state_dict = load_state_dict_in_safetensors(path_or_state_dict, device="cpu")
+
+        grouped_loras: Dict[str, Dict[str, torch.Tensor]] = {}
+        for key, value in state_dict.items():
+            if ".lora_A." in key:
+                prefix = key.split(".lora_A.", 1)[0]
+                grouped_loras.setdefault(prefix, {})["A"] = value
+            elif ".lora_B." in key:
+                prefix = key.split(".lora_B.", 1)[0]
+                grouped_loras.setdefault(prefix, {})["B"] = value
+
+        quantized_loras: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        qkv_groups: Dict[str, Dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
+        swiglu_groups: Dict[str, Dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
+
+        def _store_single(module_name: str, pair: tuple[torch.Tensor, torch.Tensor]):
+            quantized_loras[module_name] = _pad_lora_pair(*pair)
+
+        for prefix, pair in grouped_loras.items():
+            if "A" not in pair or "B" not in pair:
+                continue
+            lora_down = pair["A"].transpose(0, 1).contiguous()
+            lora_up = pair["B"].contiguous()
+            module_pair = (lora_down, lora_up)
+
+            if prefix.endswith(".attention.to_q"):
+                target = prefix[: -len(".attention.to_q")] + ".attention.fused_module"
+                qkv_groups.setdefault(target, {})[0] = module_pair
+            elif prefix.endswith(".attention.to_k"):
+                target = prefix[: -len(".attention.to_k")] + ".attention.fused_module"
+                qkv_groups.setdefault(target, {})[1] = module_pair
+            elif prefix.endswith(".attention.to_v"):
+                target = prefix[: -len(".attention.to_v")] + ".attention.fused_module"
+                qkv_groups.setdefault(target, {})[2] = module_pair
+            elif prefix.endswith(".attention.to_out.0"):
+                _store_single(prefix, module_pair)
+            elif prefix.endswith(".feed_forward.w1"):
+                target = prefix[: -len(".feed_forward.w1")] + ".feed_forward.net.0.proj"
+                swiglu_groups.setdefault(target, {})[0] = module_pair
+            elif prefix.endswith(".feed_forward.w3"):
+                target = prefix[: -len(".feed_forward.w3")] + ".feed_forward.net.0.proj"
+                swiglu_groups.setdefault(target, {})[1] = module_pair
+            elif prefix.endswith(".feed_forward.w2"):
+                target = prefix[: -len(".feed_forward.w2")] + ".feed_forward.net.2"
+                _store_single(target, module_pair)
+
+        for module_name, parts in qkv_groups.items():
+            if set(parts.keys()) != {0, 1, 2}:
+                continue
+            quantized_loras[module_name] = _fuse_lora_pairs([parts[0], parts[1], parts[2]])
+
+        for module_name, parts in swiglu_groups.items():
+            if set(parts.keys()) != {0, 1}:
+                continue
+            quantized_loras[module_name] = _fuse_lora_pairs([parts[0], parts[1]])
+
+        return quantized_loras
+
+    def _apply_quantized_lora_params(self, strength: float = 1.0):
+        for module_name, (base_down, base_up) in self._quantized_part_sd.items():
+            module = self.get_submodule(module_name)
+            lora_attrs = _zimage_lora_attrs(module)
+            if lora_attrs is None:
+                continue
+            down_attr, up_attr = lora_attrs
+            if module_name in self._quantized_part_loras:
+                extra_down, extra_up = self._quantized_part_loras[module_name]
+                merged_down = torch.cat([base_down, extra_down], dim=1)
+                merged_up = torch.cat([base_up, extra_up * strength], dim=1)
+            else:
+                merged_down = base_down
+                merged_up = base_up
+            _replace_module_parameter(module, down_attr, merged_down)
+            _replace_module_parameter(module, up_attr, merged_up)
+            if hasattr(module, "rank"):
+                module.rank = merged_down.shape[1]
+
+    def update_lora_params(self, path_or_state_dict: str | dict[str, torch.Tensor]):
+        if len(self._quantized_part_sd) == 0:
+            self._capture_base_lora_state()
+        self._quantized_part_loras = self._map_external_lora_to_quantized_modules(path_or_state_dict)
+        self._apply_quantized_lora_params(1.0)
+
+    def set_lora_strength(self, strength: float = 1.0):
+        if len(self._quantized_part_sd) == 0:
+            self._capture_base_lora_state()
+        self._apply_quantized_lora_params(strength)
+
+    def reset_lora(self):
+        self._quantized_part_loras = {}
+        if len(self._quantized_part_sd) == 0:
+            self._capture_base_lora_state()
+        self._apply_quantized_lora_params(1.0)
 
     def forward(
         self,
@@ -414,5 +588,6 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
             convert_fp16(transformer, model_state_dict)
 
         transformer.load_state_dict(model_state_dict)
+        transformer._capture_base_lora_state()
 
         return transformer
