@@ -312,6 +312,31 @@ def pack_lowrank_weight(weight: torch.Tensor, down: bool) -> torch.Tensor:
     return weight.view(c, r)
 
 
+def unpack_lowrank_weight(weight: torch.Tensor, down: bool) -> torch.Tensor:
+    """
+    Unpack a low-rank weight tensor from Nunchaku's fused W4A4 layout.
+    """
+    c, r = weight.shape
+    assert weight.dtype in (torch.float16, torch.bfloat16), f"Unsupported weight dtype {weight.dtype}."
+    lane_n, lane_k = 1, 2
+    n_pack_size, k_pack_size = 2, 2
+    num_n_lanes, num_k_lanes = 8, 4
+    frag_n = n_pack_size * num_n_lanes * lane_n
+    frag_k = k_pack_size * num_k_lanes * lane_k
+    if down:
+        r_frags, c_frags = r // frag_n, c // frag_k
+    else:
+        c_frags, r_frags = c // frag_n, r // frag_k
+    weight = weight.view(c_frags, r_frags, num_n_lanes, num_k_lanes, n_pack_size, k_pack_size, lane_k)
+    weight = weight.permute(0, 1, 4, 2, 5, 3, 6).contiguous()
+    weight = weight.view(c_frags, r_frags, frag_n, frag_k)
+    if down:
+        weight = weight.permute(1, 2, 0, 3).contiguous().view(r, c)
+    else:
+        weight = weight.permute(0, 2, 1, 3).contiguous().view(c, r)
+    return weight
+
+
 def _fuse_lora_pairs(
     lora_pairs: List[tuple[torch.Tensor, torch.Tensor]],
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -381,10 +406,8 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
 
     def _lora_debug_flags(self) -> Dict[str, bool]:
         return {
-            # Temporary isolation mode for live debugging:
-            # keep unquantized LoRA updates enabled while disabling quantized updates.
-            "disable_quantized": True,
-            "disable_unquantized": False,
+            "disable_quantized": _env_flag_enabled("NYMPHS_ZIMAGE_LORA_DISABLE_QUANTIZED"),
+            "disable_unquantized": _env_flag_enabled("NYMPHS_ZIMAGE_LORA_DISABLE_UNQUANTIZED"),
         }
 
     def _patch_model(self, skip_refiners: bool = False, **kwargs):
@@ -582,11 +605,7 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
         unmatched_prefixes: List[str] = []
 
         def _store_single(module_name: str, pair: tuple[torch.Tensor, torch.Tensor]):
-            lora_down, lora_up = pair
-            quantized_loras[module_name] = (
-                pack_lowrank_weight(lora_down, down=True),
-                pack_lowrank_weight(lora_up, down=False),
-            )
+            quantized_loras[module_name] = pair
 
         for prefix, pair in grouped_loras.items():
             if "A" not in pair or "B" not in pair:
@@ -632,10 +651,7 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
             if set(parts.keys()) != {0, 1, 2}:
                 continue
             lora_down, lora_up = _fuse_lora_pairs([parts[0], parts[1], parts[2]])
-            quantized_loras[module_name] = (
-                pack_lowrank_weight(lora_down, down=True),
-                pack_lowrank_weight(lora_up, down=False),
-            )
+            quantized_loras[module_name] = (lora_down, lora_up)
             fused_qkv_matches += 1
 
         fused_swiglu_matches = 0
@@ -649,10 +665,7 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
             #   - gate chunk should map to w1
             # So the fused LoRA order for net.0.proj must be [w3, w1].
             lora_down, lora_up = _fuse_lora_pairs([parts[1], parts[0]])
-            quantized_loras[module_name] = (
-                pack_lowrank_weight(lora_down, down=True),
-                pack_lowrank_weight(lora_up, down=False),
-            )
+            quantized_loras[module_name] = (lora_down, lora_up)
             fused_swiglu_matches += 1
 
         debug = {
@@ -683,9 +696,13 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
                 merged_up = base_up
                 base_only_modules += 1
             elif module_name in self._quantized_part_loras:
-                extra_down, extra_up = self._quantized_part_loras[module_name]
-                merged_down = torch.cat([base_down, extra_down], dim=1)
-                merged_up = torch.cat([base_up, extra_up * strength], dim=1)
+                base_down_raw = unpack_lowrank_weight(base_down, down=True)
+                base_up_raw = unpack_lowrank_weight(base_up, down=False)
+                extra_down_raw, extra_up_raw = self._quantized_part_loras[module_name]
+                merged_down_raw = torch.cat([base_down_raw, extra_down_raw.to(base_down_raw.dtype)], dim=0)
+                merged_up_raw = torch.cat([base_up_raw, (extra_up_raw * strength).to(base_up_raw.dtype)], dim=1)
+                merged_down = pack_lowrank_weight(merged_down_raw, down=True)
+                merged_up = pack_lowrank_weight(merged_up_raw, down=False)
                 updated_lora_modules += 1
             else:
                 merged_down = base_down
