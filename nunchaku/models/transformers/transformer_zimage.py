@@ -381,8 +381,10 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
 
     def _lora_debug_flags(self) -> Dict[str, bool]:
         return {
-            "disable_quantized": _env_flag_enabled("NYMPHS_ZIMAGE_LORA_DISABLE_QUANTIZED"),
-            "disable_unquantized": _env_flag_enabled("NYMPHS_ZIMAGE_LORA_DISABLE_UNQUANTIZED"),
+            # Temporary isolation mode for live debugging:
+            # keep unquantized LoRA updates enabled while disabling quantized updates.
+            "disable_quantized": True,
+            "disable_unquantized": False,
         }
 
     def _patch_model(self, skip_refiners: bool = False, **kwargs):
