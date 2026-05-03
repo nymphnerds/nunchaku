@@ -248,6 +248,10 @@ def _convert_z_image_ff(z_ff: ZImageFeedForward) -> FeedForward:
 
 def replace_fused_module(module, incompatible_keys):
     assert isinstance(module, NunchakuZImageAttention)
+    if hasattr(module, "fused_module"):
+        return
+    if not hasattr(module, "to_qkv") or not hasattr(module, "norm_q") or not hasattr(module, "norm_k"):
+        return
     module.fused_module = NunchakuZImageFusedModule(module.to_qkv, module.norm_q, module.norm_k)
     del module.to_qkv
     del module.norm_q
@@ -457,13 +461,14 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
             return
 
         device = next(self.parameters()).device
-        new_state_dict = {}
         updated_weight_modules = 0
         updated_bias_modules = 0
         base_only_modules = 0
         for key, base_tensor in self._unquantized_part_sd.items():
             base_tensor = base_tensor.to(device)
             self._unquantized_part_sd[key] = base_tensor
+            module_path, attr_name = key.rsplit(".", 1)
+            module = self.get_submodule(module_path)
 
             if base_tensor.ndim == 1 and key in self._unquantized_part_loras:
                 diff = strength * self._unquantized_part_loras[key].to(device=device, dtype=base_tensor.dtype)
@@ -475,7 +480,8 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
                         ],
                         dim=0,
                     )
-                new_state_dict[key] = base_tensor + diff
+                updated_tensor = base_tensor + diff
+                _replace_module_parameter(module, attr_name, updated_tensor)
                 updated_bias_modules += 1
             elif (
                 base_tensor.ndim == 2
@@ -517,13 +523,13 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
                     )
 
                 diff = strength * (lora_b @ lora_a)
-                new_state_dict[key] = base_tensor + diff
+                updated_tensor = base_tensor + diff
+                _replace_module_parameter(module, attr_name, updated_tensor)
                 updated_weight_modules += 1
             else:
-                new_state_dict[key] = base_tensor
+                _replace_module_parameter(module, attr_name, base_tensor)
                 base_only_modules += 1
 
-        self.load_state_dict(new_state_dict, strict=False)
         self._last_unquantized_apply_debug = {
             "updated_weight_modules": updated_weight_modules,
             "updated_bias_modules": updated_bias_modules,
