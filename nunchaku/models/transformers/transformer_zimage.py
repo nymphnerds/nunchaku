@@ -348,6 +348,13 @@ def _zimage_lora_attrs(module: nn.Module) -> tuple[str, str] | None:
     return None
 
 
+def _normalize_external_lora_key(key: str) -> str:
+    for prefix in ("diffusion_model.",):
+        if key.startswith(prefix):
+            return key[len(prefix) :]
+    return key
+
+
 class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLoaderMixin):
     """
     Nunchaku-optimized ZImageTransformer2DModel.
@@ -357,6 +364,8 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
         super().__init__(*args, **kwargs)
         self._quantized_part_sd: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
         self._quantized_part_loras: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._unquantized_part_sd: Dict[str, torch.Tensor] = {}
+        self._unquantized_part_loras: Dict[str, torch.Tensor] = {}
 
     def _patch_model(self, skip_refiners: bool = False, **kwargs):
         """
@@ -413,9 +422,15 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
 
     def _capture_base_lora_state(self):
         base_lora_state: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        base_unquantized_state: Dict[str, torch.Tensor] = {}
         for module_name, module in self.named_modules():
             lora_attrs = _zimage_lora_attrs(module)
             if lora_attrs is None:
+                if isinstance(module, nn.Linear):
+                    if module.weight is not None:
+                        base_unquantized_state[f"{module_name}.weight"] = module.weight.detach().clone()
+                    if module.bias is not None:
+                        base_unquantized_state[f"{module_name}.bias"] = module.bias.detach().clone()
                 continue
             down_attr, up_attr = lora_attrs
             lora_down = getattr(module, down_attr, None)
@@ -427,11 +442,79 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
                 lora_up.detach().clone(),
             )
         self._quantized_part_sd = base_lora_state
+        self._unquantized_part_sd = base_unquantized_state
+
+    def _update_unquantized_part_lora_params(self, strength: float = 1.0):
+        if len(self._unquantized_part_sd) == 0:
+            return
+
+        device = next(self.parameters()).device
+        new_state_dict = {}
+        for key, base_tensor in self._unquantized_part_sd.items():
+            base_tensor = base_tensor.to(device)
+            self._unquantized_part_sd[key] = base_tensor
+
+            if base_tensor.ndim == 1 and key in self._unquantized_part_loras:
+                diff = strength * self._unquantized_part_loras[key].to(device=device, dtype=base_tensor.dtype)
+                if diff.shape[0] < base_tensor.shape[0]:
+                    diff = torch.cat(
+                        [
+                            diff,
+                            torch.zeros(base_tensor.shape[0] - diff.shape[0], device=device, dtype=base_tensor.dtype),
+                        ],
+                        dim=0,
+                    )
+                new_state_dict[key] = base_tensor + diff
+            elif (
+                base_tensor.ndim == 2
+                and key.replace(".weight", ".lora_B.weight") in self._unquantized_part_loras
+                and key.replace(".weight", ".lora_A.weight") in self._unquantized_part_loras
+            ):
+                lora_a = self._unquantized_part_loras[key.replace(".weight", ".lora_A.weight")].to(
+                    device=device, dtype=base_tensor.dtype
+                )
+                lora_b = self._unquantized_part_loras[key.replace(".weight", ".lora_B.weight")].to(
+                    device=device, dtype=base_tensor.dtype
+                )
+
+                if lora_a.shape[1] < base_tensor.shape[1]:
+                    lora_a = torch.cat(
+                        [
+                            lora_a,
+                            torch.zeros(
+                                lora_a.shape[0],
+                                base_tensor.shape[1] - lora_a.shape[1],
+                                device=device,
+                                dtype=base_tensor.dtype,
+                            ),
+                        ],
+                        dim=1,
+                    )
+                if lora_b.shape[0] < base_tensor.shape[0]:
+                    lora_b = torch.cat(
+                        [
+                            lora_b,
+                            torch.zeros(
+                                base_tensor.shape[0] - lora_b.shape[0],
+                                lora_b.shape[1],
+                                device=device,
+                                dtype=base_tensor.dtype,
+                            ),
+                        ],
+                        dim=0,
+                    )
+
+                diff = strength * (lora_b @ lora_a)
+                new_state_dict[key] = base_tensor + diff
+            else:
+                new_state_dict[key] = base_tensor
+
+        self.load_state_dict(new_state_dict, strict=False)
 
     def _map_external_lora_to_quantized_modules(
         self,
         path_or_state_dict: str | dict[str, torch.Tensor],
-    ) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> tuple[Dict[str, Tuple[torch.Tensor, torch.Tensor]], Dict[str, torch.Tensor]]:
         if isinstance(path_or_state_dict, dict):
             state_dict = dict(path_or_state_dict)
         else:
@@ -439,6 +522,7 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
 
         grouped_loras: Dict[str, Dict[str, torch.Tensor]] = {}
         for key, value in state_dict.items():
+            key = _normalize_external_lora_key(key)
             if ".lora_A." in key:
                 prefix = key.split(".lora_A.", 1)[0]
                 grouped_loras.setdefault(prefix, {})["A"] = value
@@ -447,6 +531,7 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
                 grouped_loras.setdefault(prefix, {})["B"] = value
 
         quantized_loras: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        unquantized_loras: Dict[str, torch.Tensor] = {}
         qkv_groups: Dict[str, Dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
         swiglu_groups: Dict[str, Dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
 
@@ -484,6 +569,9 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
             elif prefix.endswith(".feed_forward.w2"):
                 target = prefix[: -len(".feed_forward.w2")] + ".feed_forward.net.2"
                 _store_single(target, module_pair)
+            elif f"{prefix}.weight" in self._unquantized_part_sd:
+                unquantized_loras[f"{prefix}.lora_A.weight"] = lora_down
+                unquantized_loras[f"{prefix}.lora_B.weight"] = lora_up
 
         for module_name, parts in qkv_groups.items():
             if set(parts.keys()) != {0, 1, 2}:
@@ -509,7 +597,7 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
                 pack_lowrank_weight(lora_up, down=False),
             )
 
-        return quantized_loras
+        return quantized_loras, unquantized_loras
 
     def _apply_quantized_lora_params(self, strength: float = 1.0):
         for module_name, (base_down, base_up) in self._quantized_part_sd.items():
@@ -533,19 +621,27 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
     def update_lora_params(self, path_or_state_dict: str | dict[str, torch.Tensor]):
         if len(self._quantized_part_sd) == 0:
             self._capture_base_lora_state()
-        self._quantized_part_loras = self._map_external_lora_to_quantized_modules(path_or_state_dict)
+        quantized_loras, unquantized_loras = self._map_external_lora_to_quantized_modules(path_or_state_dict)
+        if len(quantized_loras) == 0 and len(unquantized_loras) == 0:
+            raise ValueError("No Z-Image LoRA weights matched the current Nunchaku transformer modules.")
+        self._quantized_part_loras = quantized_loras
+        self._unquantized_part_loras = unquantized_loras
         self._apply_quantized_lora_params(1.0)
+        self._update_unquantized_part_lora_params(1.0)
 
     def set_lora_strength(self, strength: float = 1.0):
         if len(self._quantized_part_sd) == 0:
             self._capture_base_lora_state()
         self._apply_quantized_lora_params(strength)
+        self._update_unquantized_part_lora_params(strength)
 
     def reset_lora(self):
         self._quantized_part_loras = {}
+        self._unquantized_part_loras = {}
         if len(self._quantized_part_sd) == 0:
             self._capture_base_lora_state()
         self._apply_quantized_lora_params(1.0)
+        self._update_unquantized_part_lora_params(1.0)
 
     def forward(
         self,
