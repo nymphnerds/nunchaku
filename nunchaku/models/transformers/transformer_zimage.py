@@ -359,6 +359,11 @@ def _normalize_external_lora_key(key: str) -> str:
     return key
 
 
+def _env_flag_enabled(name: str) -> bool:
+    raw = os.getenv(name, "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLoaderMixin):
     """
     Nunchaku-optimized ZImageTransformer2DModel.
@@ -373,6 +378,12 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
         self._last_lora_debug: Dict[str, object] = {}
         self._last_quantized_apply_debug: Dict[str, int] = {}
         self._last_unquantized_apply_debug: Dict[str, int] = {}
+
+    def _lora_debug_flags(self) -> Dict[str, bool]:
+        return {
+            "disable_quantized": _env_flag_enabled("NYMPHS_ZIMAGE_LORA_DISABLE_QUANTIZED"),
+            "disable_unquantized": _env_flag_enabled("NYMPHS_ZIMAGE_LORA_DISABLE_UNQUANTIZED"),
+        }
 
     def _patch_model(self, skip_refiners: bool = False, **kwargs):
         """
@@ -457,10 +468,12 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
                 "updated_weight_modules": 0,
                 "updated_bias_modules": 0,
                 "base_only_modules": 0,
+                "disabled": self._lora_debug_flags()["disable_unquantized"],
             }
             return
 
         device = next(self.parameters()).device
+        disable_unquantized = self._lora_debug_flags()["disable_unquantized"]
         updated_weight_modules = 0
         updated_bias_modules = 0
         base_only_modules = 0
@@ -470,7 +483,10 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
             module_path, attr_name = key.rsplit(".", 1)
             module = self.get_submodule(module_path)
 
-            if base_tensor.ndim == 1 and key in self._unquantized_part_loras:
+            if disable_unquantized:
+                _replace_module_parameter(module, attr_name, base_tensor)
+                base_only_modules += 1
+            elif base_tensor.ndim == 1 and key in self._unquantized_part_loras:
                 diff = strength * self._unquantized_part_loras[key].to(device=device, dtype=base_tensor.dtype)
                 if diff.shape[0] < base_tensor.shape[0]:
                     diff = torch.cat(
@@ -534,6 +550,7 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
             "updated_weight_modules": updated_weight_modules,
             "updated_bias_modules": updated_bias_modules,
             "base_only_modules": base_only_modules,
+            "disabled": disable_unquantized,
         }
 
     def _map_external_lora_to_quantized_modules(
@@ -650,6 +667,7 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
         return quantized_loras, unquantized_loras, debug
 
     def _apply_quantized_lora_params(self, strength: float = 1.0):
+        disable_quantized = self._lora_debug_flags()["disable_quantized"]
         updated_lora_modules = 0
         base_only_modules = 0
         for module_name, (base_down, base_up) in self._quantized_part_sd.items():
@@ -658,7 +676,11 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
             if lora_attrs is None:
                 continue
             down_attr, up_attr = lora_attrs
-            if module_name in self._quantized_part_loras:
+            if disable_quantized:
+                merged_down = base_down
+                merged_up = base_up
+                base_only_modules += 1
+            elif module_name in self._quantized_part_loras:
                 extra_down, extra_up = self._quantized_part_loras[module_name]
                 merged_down = torch.cat([base_down, extra_down], dim=1)
                 merged_up = torch.cat([base_up, extra_up * strength], dim=1)
@@ -674,10 +696,12 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
         self._last_quantized_apply_debug = {
             "updated_lora_modules": updated_lora_modules,
             "base_only_modules": base_only_modules,
+            "disabled": disable_quantized,
         }
 
     def get_lora_debug_summary(self) -> Dict[str, object]:
         summary = dict(self._last_lora_debug)
+        summary["flags"] = self._lora_debug_flags()
         summary["quantized_apply"] = dict(self._last_quantized_apply_debug)
         summary["unquantized_apply"] = dict(self._last_unquantized_apply_debug)
         return summary
