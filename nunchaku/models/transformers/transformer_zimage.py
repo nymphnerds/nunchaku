@@ -16,11 +16,12 @@ from diffusers.models.transformers.transformer_z_image import FeedForward as ZIm
 from diffusers.models.transformers.transformer_z_image import ZImageTransformer2DModel, ZImageTransformerBlock
 from huggingface_hub import utils
 
+from ...lora.zimage.nunchaku_converter import pack_lowrank_weight, to_nunchaku, unpack_lowrank_weight
 from nunchaku.models.unets.unet_sdxl import NunchakuSDXLFeedForward
 
 from ...ops.gemm import svdq_gemm_w4a4_cuda
 from ...ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda
-from ...utils import get_precision, load_state_dict_in_safetensors, pad_tensor
+from ...utils import get_precision, pad_tensor
 from ..attention import NunchakuBaseAttention
 from ..attention_processors.zimage import NunchakuZSingleStreamAttnProcessor
 from ..embeddings import pack_rotemb
@@ -278,88 +279,6 @@ class NunchakuZImageFeedForward(NunchakuSDXLFeedForward):
         NunchakuSDXLFeedForward.__init__(self, converted_ff, **kwargs)
 
 
-def pack_lowrank_weight(weight: torch.Tensor, down: bool) -> torch.Tensor:
-    """
-    Pack a low-rank weight tensor into the layout expected by Nunchaku's
-    fused W4A4 kernels.
-
-    Parameters
-    ----------
-    weight : torch.Tensor
-        Unpacked low-rank weight tensor.
-    down : bool
-        True for the down-projection (rank x in), False for the up-projection
-        (out x rank).
-    """
-    assert weight.dtype in (torch.float16, torch.bfloat16), f"Unsupported weight dtype {weight.dtype}."
-    lane_n, lane_k = 1, 2
-    n_pack_size, k_pack_size = 2, 2
-    num_n_lanes, num_k_lanes = 8, 4
-    frag_n = n_pack_size * num_n_lanes * lane_n
-    frag_k = k_pack_size * num_k_lanes * lane_k
-    weight = pad_tensor(weight, frag_n, 0)
-    weight = pad_tensor(weight, frag_k, 1)
-    if down:
-        r, c = weight.shape
-        r_frags, c_frags = r // frag_n, c // frag_k
-        weight = weight.view(r_frags, frag_n, c_frags, frag_k).permute(2, 0, 1, 3)
-    else:
-        c, r = weight.shape
-        c_frags, r_frags = c // frag_n, r // frag_k
-        weight = weight.view(c_frags, frag_n, r_frags, frag_k).permute(0, 2, 1, 3)
-    weight = weight.reshape(c_frags, r_frags, n_pack_size, num_n_lanes, k_pack_size, num_k_lanes, lane_k)
-    weight = weight.permute(0, 1, 3, 5, 2, 4, 6).contiguous()
-    return weight.view(c, r)
-
-
-def unpack_lowrank_weight(weight: torch.Tensor, down: bool) -> torch.Tensor:
-    """
-    Unpack a low-rank weight tensor from Nunchaku's fused W4A4 layout.
-    """
-    c, r = weight.shape
-    assert weight.dtype in (torch.float16, torch.bfloat16), f"Unsupported weight dtype {weight.dtype}."
-    lane_n, lane_k = 1, 2
-    n_pack_size, k_pack_size = 2, 2
-    num_n_lanes, num_k_lanes = 8, 4
-    frag_n = n_pack_size * num_n_lanes * lane_n
-    frag_k = k_pack_size * num_k_lanes * lane_k
-    if down:
-        r_frags, c_frags = r // frag_n, c // frag_k
-    else:
-        c_frags, r_frags = c // frag_n, r // frag_k
-    weight = weight.view(c_frags, r_frags, num_n_lanes, num_k_lanes, n_pack_size, k_pack_size, lane_k)
-    weight = weight.permute(0, 1, 4, 2, 5, 3, 6).contiguous()
-    weight = weight.view(c_frags, r_frags, frag_n, frag_k)
-    if down:
-        weight = weight.permute(1, 2, 0, 3).contiguous().view(r, c)
-    else:
-        weight = weight.permute(0, 2, 1, 3).contiguous().view(c, r)
-    return weight
-
-
-def _fuse_lora_pairs(
-    lora_pairs: List[tuple[torch.Tensor, torch.Tensor]],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if all(down.equal(lora_pairs[0][0]) for down, _ in lora_pairs[1:]):
-        lora_down = lora_pairs[0][0]
-        lora_up = torch.cat([up for _, up in lora_pairs], dim=0)
-        return lora_down, lora_up
-
-    lora_down = torch.cat([down for down, _ in lora_pairs], dim=0)
-    total_rank = lora_down.shape[0]
-    total_out = sum(up.shape[0] for _, up in lora_pairs)
-    lora_up = torch.zeros(total_out, total_rank, dtype=lora_pairs[0][1].dtype, device=lora_pairs[0][1].device)
-    row_offset = 0
-    col_offset = 0
-    for down, up in lora_pairs:
-        out_features = up.shape[0]
-        rank = down.shape[0]
-        lora_up[row_offset : row_offset + out_features, col_offset : col_offset + rank] = up
-        row_offset += out_features
-        col_offset += rank
-    return lora_down, lora_up
-
-
 def _replace_module_parameter(module: nn.Module, attr_name: str, tensor: torch.Tensor):
     old_param = getattr(module, attr_name)
     new_param = nn.Parameter(
@@ -375,14 +294,6 @@ def _zimage_lora_attrs(module: nn.Module) -> tuple[str, str] | None:
     if isinstance(module, NunchakuZImageFusedModule):
         return "qkv_proj_down", "qkv_proj_up"
     return None
-
-
-def _normalize_external_lora_key(key: str) -> str:
-    for prefix in ("diffusion_model.",):
-        if key.startswith(prefix):
-            return key[len(prefix) :]
-    return key
-
 
 def _env_flag_enabled(name: str) -> bool:
     raw = os.getenv(name, "")
@@ -578,109 +489,6 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
             "disabled": disable_unquantized,
         }
 
-    def _map_external_lora_to_quantized_modules(
-        self,
-        path_or_state_dict: str | dict[str, torch.Tensor],
-    ) -> tuple[Dict[str, Tuple[torch.Tensor, torch.Tensor]], Dict[str, torch.Tensor], Dict[str, object]]:
-        if isinstance(path_or_state_dict, dict):
-            state_dict = dict(path_or_state_dict)
-        else:
-            state_dict = load_state_dict_in_safetensors(path_or_state_dict, device="cpu")
-
-        grouped_loras: Dict[str, Dict[str, torch.Tensor]] = {}
-        for key, value in state_dict.items():
-            key = _normalize_external_lora_key(key)
-            if ".lora_A." in key:
-                prefix = key.split(".lora_A.", 1)[0]
-                grouped_loras.setdefault(prefix, {})["A"] = value
-            elif ".lora_B." in key:
-                prefix = key.split(".lora_B.", 1)[0]
-                grouped_loras.setdefault(prefix, {})["B"] = value
-
-        quantized_loras: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
-        unquantized_loras: Dict[str, torch.Tensor] = {}
-        qkv_groups: Dict[str, Dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
-        swiglu_groups: Dict[str, Dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
-        direct_quantized_matches = 0
-        unmatched_prefixes: List[str] = []
-
-        def _store_single(module_name: str, pair: tuple[torch.Tensor, torch.Tensor]):
-            quantized_loras[module_name] = pair
-
-        for prefix, pair in grouped_loras.items():
-            if "A" not in pair or "B" not in pair:
-                continue
-            lora_down = pair["A"].contiguous()
-            lora_up = pair["B"].contiguous()
-            module_pair = (lora_down, lora_up)
-            matched = True
-
-            if prefix.endswith(".attention.to_q"):
-                target = prefix[: -len(".attention.to_q")] + ".attention.fused_module"
-                qkv_groups.setdefault(target, {})[0] = module_pair
-            elif prefix.endswith(".attention.to_k"):
-                target = prefix[: -len(".attention.to_k")] + ".attention.fused_module"
-                qkv_groups.setdefault(target, {})[1] = module_pair
-            elif prefix.endswith(".attention.to_v"):
-                target = prefix[: -len(".attention.to_v")] + ".attention.fused_module"
-                qkv_groups.setdefault(target, {})[2] = module_pair
-            elif prefix.endswith(".attention.to_out.0"):
-                _store_single(prefix, module_pair)
-                direct_quantized_matches += 1
-            elif prefix.endswith(".feed_forward.w1"):
-                target = prefix[: -len(".feed_forward.w1")] + ".feed_forward.net.0.proj"
-                swiglu_groups.setdefault(target, {})[0] = module_pair
-            elif prefix.endswith(".feed_forward.w3"):
-                target = prefix[: -len(".feed_forward.w3")] + ".feed_forward.net.0.proj"
-                swiglu_groups.setdefault(target, {})[1] = module_pair
-            elif prefix.endswith(".feed_forward.w2"):
-                target = prefix[: -len(".feed_forward.w2")] + ".feed_forward.net.2"
-                _store_single(target, module_pair)
-                direct_quantized_matches += 1
-            elif f"{prefix}.weight" in self._unquantized_part_sd:
-                unquantized_loras[f"{prefix}.lora_A.weight"] = lora_down
-                unquantized_loras[f"{prefix}.lora_B.weight"] = lora_up
-            else:
-                matched = False
-
-            if not matched:
-                unmatched_prefixes.append(prefix)
-
-        fused_qkv_matches = 0
-        for module_name, parts in qkv_groups.items():
-            if set(parts.keys()) != {0, 1, 2}:
-                continue
-            lora_down, lora_up = _fuse_lora_pairs([parts[0], parts[1], parts[2]])
-            quantized_loras[module_name] = (lora_down, lora_up)
-            fused_qkv_matches += 1
-
-        fused_swiglu_matches = 0
-        for module_name, parts in swiglu_groups.items():
-            if set(parts.keys()) != {0, 1}:
-                continue
-            # diffusers' SwiGLU proj is ordered as [hidden, gate], while the
-            # original Z-Image feed-forward uses w2(silu(w1(x)) * w3(x)).
-            # That means:
-            #   - hidden chunk should map to w3
-            #   - gate chunk should map to w1
-            # So the fused LoRA order for net.0.proj must be [w3, w1].
-            lora_down, lora_up = _fuse_lora_pairs([parts[1], parts[0]])
-            quantized_loras[module_name] = (lora_down, lora_up)
-            fused_swiglu_matches += 1
-
-        debug = {
-            "state_tensor_count": len(state_dict),
-            "grouped_prefix_count": len(grouped_loras),
-            "quantized_module_matches": len(quantized_loras),
-            "direct_quantized_matches": direct_quantized_matches,
-            "fused_qkv_matches": fused_qkv_matches,
-            "fused_swiglu_matches": fused_swiglu_matches,
-            "unquantized_weight_matches": len(unquantized_loras) // 2,
-            "unmatched_prefix_count": len(unmatched_prefixes),
-            "unmatched_prefix_examples": unmatched_prefixes[:8],
-        }
-        return quantized_loras, unquantized_loras, debug
-
     def _apply_quantized_lora_params(self, strength: float = 1.0):
         disable_quantized = self._lora_debug_flags()["disable_quantized"]
         updated_lora_modules = 0
@@ -728,9 +536,15 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
     def update_lora_params(self, path_or_state_dict: str | dict[str, torch.Tensor]):
         if len(self._quantized_part_sd) == 0:
             self._capture_base_lora_state()
-        quantized_loras, unquantized_loras, debug = self._map_external_lora_to_quantized_modules(path_or_state_dict)
+        converted = to_nunchaku(
+            path_or_state_dict,
+            base_sd=self._quantized_part_sd,
+            base_unquantized_sd=self._unquantized_part_sd,
+        )
+        quantized_loras = converted["quantized"]
+        unquantized_loras = converted["unquantized"]
+        debug = converted["debug"]
         if len(quantized_loras) == 0 and len(unquantized_loras) == 0:
-            debug["path"] = path_or_state_dict if isinstance(path_or_state_dict, str) else "<state_dict>"
             self._last_lora_debug = debug
             print(f"[nunchaku:zimage:lora] no_matches {json.dumps(debug, sort_keys=True)}", flush=True)
             raise ValueError("No Z-Image LoRA weights matched the current Nunchaku transformer modules.")
@@ -738,7 +552,6 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
         self._unquantized_part_loras = unquantized_loras
         self._apply_quantized_lora_params(1.0)
         self._update_unquantized_part_lora_params(1.0)
-        debug["path"] = path_or_state_dict if isinstance(path_or_state_dict, str) else "<state_dict>"
         debug["base_quantized_modules"] = len(self._quantized_part_sd)
         debug["base_unquantized_tensors"] = len(self._unquantized_part_sd)
         self._last_lora_debug = debug
