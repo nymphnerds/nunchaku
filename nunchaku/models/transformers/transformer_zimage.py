@@ -366,6 +366,9 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
         self._quantized_part_loras: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
         self._unquantized_part_sd: Dict[str, torch.Tensor] = {}
         self._unquantized_part_loras: Dict[str, torch.Tensor] = {}
+        self._last_lora_debug: Dict[str, object] = {}
+        self._last_quantized_apply_debug: Dict[str, int] = {}
+        self._last_unquantized_apply_debug: Dict[str, int] = {}
 
     def _patch_model(self, skip_refiners: bool = False, **kwargs):
         """
@@ -446,10 +449,18 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
 
     def _update_unquantized_part_lora_params(self, strength: float = 1.0):
         if len(self._unquantized_part_sd) == 0:
+            self._last_unquantized_apply_debug = {
+                "updated_weight_modules": 0,
+                "updated_bias_modules": 0,
+                "base_only_modules": 0,
+            }
             return
 
         device = next(self.parameters()).device
         new_state_dict = {}
+        updated_weight_modules = 0
+        updated_bias_modules = 0
+        base_only_modules = 0
         for key, base_tensor in self._unquantized_part_sd.items():
             base_tensor = base_tensor.to(device)
             self._unquantized_part_sd[key] = base_tensor
@@ -465,6 +476,7 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
                         dim=0,
                     )
                 new_state_dict[key] = base_tensor + diff
+                updated_bias_modules += 1
             elif (
                 base_tensor.ndim == 2
                 and key.replace(".weight", ".lora_B.weight") in self._unquantized_part_loras
@@ -506,15 +518,22 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
 
                 diff = strength * (lora_b @ lora_a)
                 new_state_dict[key] = base_tensor + diff
+                updated_weight_modules += 1
             else:
                 new_state_dict[key] = base_tensor
+                base_only_modules += 1
 
         self.load_state_dict(new_state_dict, strict=False)
+        self._last_unquantized_apply_debug = {
+            "updated_weight_modules": updated_weight_modules,
+            "updated_bias_modules": updated_bias_modules,
+            "base_only_modules": base_only_modules,
+        }
 
     def _map_external_lora_to_quantized_modules(
         self,
         path_or_state_dict: str | dict[str, torch.Tensor],
-    ) -> tuple[Dict[str, Tuple[torch.Tensor, torch.Tensor]], Dict[str, torch.Tensor]]:
+    ) -> tuple[Dict[str, Tuple[torch.Tensor, torch.Tensor]], Dict[str, torch.Tensor], Dict[str, object]]:
         if isinstance(path_or_state_dict, dict):
             state_dict = dict(path_or_state_dict)
         else:
@@ -534,6 +553,8 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
         unquantized_loras: Dict[str, torch.Tensor] = {}
         qkv_groups: Dict[str, Dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
         swiglu_groups: Dict[str, Dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
+        direct_quantized_matches = 0
+        unmatched_prefixes: List[str] = []
 
         def _store_single(module_name: str, pair: tuple[torch.Tensor, torch.Tensor]):
             lora_down, lora_up = pair
@@ -548,6 +569,7 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
             lora_down = pair["A"].contiguous()
             lora_up = pair["B"].contiguous()
             module_pair = (lora_down, lora_up)
+            matched = True
 
             if prefix.endswith(".attention.to_q"):
                 target = prefix[: -len(".attention.to_q")] + ".attention.fused_module"
@@ -560,6 +582,7 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
                 qkv_groups.setdefault(target, {})[2] = module_pair
             elif prefix.endswith(".attention.to_out.0"):
                 _store_single(prefix, module_pair)
+                direct_quantized_matches += 1
             elif prefix.endswith(".feed_forward.w1"):
                 target = prefix[: -len(".feed_forward.w1")] + ".feed_forward.net.0.proj"
                 swiglu_groups.setdefault(target, {})[0] = module_pair
@@ -569,10 +592,17 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
             elif prefix.endswith(".feed_forward.w2"):
                 target = prefix[: -len(".feed_forward.w2")] + ".feed_forward.net.2"
                 _store_single(target, module_pair)
+                direct_quantized_matches += 1
             elif f"{prefix}.weight" in self._unquantized_part_sd:
                 unquantized_loras[f"{prefix}.lora_A.weight"] = lora_down
                 unquantized_loras[f"{prefix}.lora_B.weight"] = lora_up
+            else:
+                matched = False
 
+            if not matched:
+                unmatched_prefixes.append(prefix)
+
+        fused_qkv_matches = 0
         for module_name, parts in qkv_groups.items():
             if set(parts.keys()) != {0, 1, 2}:
                 continue
@@ -581,7 +611,9 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
                 pack_lowrank_weight(lora_down, down=True),
                 pack_lowrank_weight(lora_up, down=False),
             )
+            fused_qkv_matches += 1
 
+        fused_swiglu_matches = 0
         for module_name, parts in swiglu_groups.items():
             if set(parts.keys()) != {0, 1}:
                 continue
@@ -596,10 +628,24 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
                 pack_lowrank_weight(lora_down, down=True),
                 pack_lowrank_weight(lora_up, down=False),
             )
+            fused_swiglu_matches += 1
 
-        return quantized_loras, unquantized_loras
+        debug = {
+            "state_tensor_count": len(state_dict),
+            "grouped_prefix_count": len(grouped_loras),
+            "quantized_module_matches": len(quantized_loras),
+            "direct_quantized_matches": direct_quantized_matches,
+            "fused_qkv_matches": fused_qkv_matches,
+            "fused_swiglu_matches": fused_swiglu_matches,
+            "unquantized_weight_matches": len(unquantized_loras) // 2,
+            "unmatched_prefix_count": len(unmatched_prefixes),
+            "unmatched_prefix_examples": unmatched_prefixes[:8],
+        }
+        return quantized_loras, unquantized_loras, debug
 
     def _apply_quantized_lora_params(self, strength: float = 1.0):
+        updated_lora_modules = 0
+        base_only_modules = 0
         for module_name, (base_down, base_up) in self._quantized_part_sd.items():
             module = self.get_submodule(module_name)
             lora_attrs = _zimage_lora_attrs(module)
@@ -610,30 +656,52 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
                 extra_down, extra_up = self._quantized_part_loras[module_name]
                 merged_down = torch.cat([base_down, extra_down], dim=1)
                 merged_up = torch.cat([base_up, extra_up * strength], dim=1)
+                updated_lora_modules += 1
             else:
                 merged_down = base_down
                 merged_up = base_up
+                base_only_modules += 1
             _replace_module_parameter(module, down_attr, merged_down)
             _replace_module_parameter(module, up_attr, merged_up)
             if hasattr(module, "rank"):
                 module.rank = merged_down.shape[1]
+        self._last_quantized_apply_debug = {
+            "updated_lora_modules": updated_lora_modules,
+            "base_only_modules": base_only_modules,
+        }
+
+    def get_lora_debug_summary(self) -> Dict[str, object]:
+        summary = dict(self._last_lora_debug)
+        summary["quantized_apply"] = dict(self._last_quantized_apply_debug)
+        summary["unquantized_apply"] = dict(self._last_unquantized_apply_debug)
+        return summary
 
     def update_lora_params(self, path_or_state_dict: str | dict[str, torch.Tensor]):
         if len(self._quantized_part_sd) == 0:
             self._capture_base_lora_state()
-        quantized_loras, unquantized_loras = self._map_external_lora_to_quantized_modules(path_or_state_dict)
+        quantized_loras, unquantized_loras, debug = self._map_external_lora_to_quantized_modules(path_or_state_dict)
         if len(quantized_loras) == 0 and len(unquantized_loras) == 0:
+            debug["path"] = path_or_state_dict if isinstance(path_or_state_dict, str) else "<state_dict>"
+            self._last_lora_debug = debug
+            print(f"[nunchaku:zimage:lora] no_matches {json.dumps(debug, sort_keys=True)}", flush=True)
             raise ValueError("No Z-Image LoRA weights matched the current Nunchaku transformer modules.")
         self._quantized_part_loras = quantized_loras
         self._unquantized_part_loras = unquantized_loras
         self._apply_quantized_lora_params(1.0)
         self._update_unquantized_part_lora_params(1.0)
+        debug["path"] = path_or_state_dict if isinstance(path_or_state_dict, str) else "<state_dict>"
+        debug["base_quantized_modules"] = len(self._quantized_part_sd)
+        debug["base_unquantized_tensors"] = len(self._unquantized_part_sd)
+        self._last_lora_debug = debug
+        print(f"[nunchaku:zimage:lora] loaded {json.dumps(self.get_lora_debug_summary(), sort_keys=True)}", flush=True)
 
     def set_lora_strength(self, strength: float = 1.0):
         if len(self._quantized_part_sd) == 0:
             self._capture_base_lora_state()
         self._apply_quantized_lora_params(strength)
         self._update_unquantized_part_lora_params(strength)
+        self._last_lora_debug["strength"] = float(strength)
+        print(f"[nunchaku:zimage:lora] strength {json.dumps(self.get_lora_debug_summary(), sort_keys=True)}", flush=True)
 
     def reset_lora(self):
         self._quantized_part_loras = {}
@@ -642,6 +710,8 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
             self._capture_base_lora_state()
         self._apply_quantized_lora_params(1.0)
         self._update_unquantized_part_lora_params(1.0)
+        self._last_lora_debug = {"reset": True}
+        print(f"[nunchaku:zimage:lora] reset {json.dumps(self.get_lora_debug_summary(), sort_keys=True)}", flush=True)
 
     def forward(
         self,
