@@ -96,6 +96,10 @@ class NunchakuZImageFusedModule(nn.Module):
         The projection results of q, k, v. q result and k result are RMS-normalized and applied RoPE.
         """
         batch_size, seq_len, channels = x.shape
+        if freqs_cis is not None and freqs_cis.is_complex():
+            freqs_cis = torch.view_as_real(freqs_cis).unsqueeze(3)
+            freqs_cis = torch.flip(freqs_cis, dims=[-1])
+            freqs_cis = pack_rotemb(pad_tensor(freqs_cis, 256, 1))
         x = x.view(batch_size * seq_len, channels)
         quantized_x, ascales, lora_act_out = svdq_quantize_w4a4_act_fuse_lora_cuda(
             x,
