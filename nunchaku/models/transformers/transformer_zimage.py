@@ -2,6 +2,7 @@
 This module provides Nunchaku ZImageTransformer2DModel and its building blocks in Python.
 """
 
+import inspect
 import json
 import os
 from pathlib import Path
@@ -583,16 +584,42 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
         patch_size=2,
         f_patch_size=1,
         return_dict: bool = True,
+        controlnet_block_samples: Optional[Dict[int, torch.Tensor]] = None,
+        siglip_feats: Optional[List[List[torch.Tensor]]] = None,
+        image_noise_mask: Optional[List[List[int]]] = None,
+        **kwargs,
     ):
         """
         Adapted from diffusers.models.transformers.transformer_z_image.ZImageTransformer2DModel#forward
 
         Register pre-forward hooks for caching and substitution of packed `freqs_cis` tensor for all attention submodules and unregister after forwarding is done.
         """
+        if isinstance(patch_size, bool) and f_patch_size == 1 and return_dict is True:
+            return_dict = patch_size
+            patch_size = 2
+
+        parent_forward = super().forward
+        parent_parameters = inspect.signature(parent_forward).parameters
+        call_kwargs = {
+            "x": x,
+            "t": t,
+            "cap_feats": cap_feats,
+            "return_dict": return_dict,
+            "patch_size": patch_size,
+            "f_patch_size": f_patch_size,
+            "controlnet_block_samples": controlnet_block_samples,
+            "siglip_feats": siglip_feats,
+            "image_noise_mask": image_noise_mask,
+        }
+        for name, value in kwargs.items():
+            if name in parent_parameters:
+                call_kwargs[name] = value
+
         rope_hook = NunchakuZImageRopeHook()
         self.register_rope_hook(rope_hook)
         try:
-            return super().forward(x, t, cap_feats, patch_size, f_patch_size, return_dict)
+            supported_kwargs = {key: value for key, value in call_kwargs.items() if key in parent_parameters}
+            return parent_forward(**supported_kwargs)
         finally:
             self.unregister_rope_hook()
             del rope_hook
