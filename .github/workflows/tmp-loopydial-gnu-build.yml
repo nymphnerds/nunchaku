@@ -1,0 +1,64 @@
+name: Temporary Loopy Dial GNU ARM Build
+
+on:
+  push:
+    branches:
+      - tmp-loopydial-gnu-build
+    paths:
+      - 'tmp-loopydial-gnu/**'
+      - '.github/workflows/tmp-loopydial-gnu-build.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install GNU Arm Embedded toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi
+          arm-none-eabi-c++ --version
+
+      - name: Checkout official disting NT API
+        run: |
+          git clone --depth 1 https://github.com/expertsleepersltd/distingNT_API.git tmp-loopydial-gnu/distingNT_API
+
+      - name: Build exactly as a gallery-style single-file plugin
+        working-directory: tmp-loopydial-gnu
+        run: |
+          mkdir -p plugins
+          arm-none-eabi-c++ \
+            -std=c++11 \
+            -mcpu=cortex-m7 \
+            -mfpu=fpv5-d16 \
+            -mfloat-abi=hard \
+            -mthumb \
+            -fno-rtti \
+            -fno-exceptions \
+            -Os \
+            -fPIC \
+            -Wall \
+            -IdistingNT_API/include \
+            -c -o plugins/loopydial.o loopydial.cpp
+
+      - name: Verify object
+        working-directory: tmp-loopydial-gnu
+        run: |
+          file plugins/loopydial.o
+          arm-none-eabi-nm plugins/loopydial.o | grep pluginEntry
+          arm-none-eabi-readelf -h plugins/loopydial.o
+          arm-none-eabi-readelf -A plugins/loopydial.o
+          echo 'Undefined symbols:'
+          arm-none-eabi-nm plugins/loopydial.o | grep ' U ' || true
+          echo 'Size:'
+          arm-none-eabi-size -A plugins/loopydial.o
+
+      - name: Upload GNU-built object
+        uses: actions/upload-artifact@v4
+        with:
+          name: loopydial-gnu-arm
+          path: tmp-loopydial-gnu/plugins/loopydial.o
+          if-no-files-found: error
